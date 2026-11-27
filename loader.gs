@@ -26,3 +26,11 @@ function authorize() {
   LockService.getScriptLock();
   UrlFetchApp.fetch('https://api.line.me/v2/bot/info', { muteHttpExceptions: true });
 }
+
+// 定時任務：每小時跑一次，由 bot.js 決定要做什麼（例如每週一送上週總結）
+function cron() { loadBot_(); globalThis.__bot.cron(); }
+// 只要執行一次：建立「每小時執行 cron」的觸發條件
+function setupCron() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'cron') ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('cron').timeBased().everyHours(1).create();
+}

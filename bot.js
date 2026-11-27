@@ -19,6 +19,11 @@ const HELP =
   '  今日、本週、上週、本月、上月：明細\n' +
   '  11/20：查某天\n' +
   '  查 豬肉：查品項（查 豬 牛＝任一）\n' +
+  '  分類：本月各類花費（分類 上月／本週／上週）\n' +
+  '【分類設定】\n' +
+  '  分類 麥當勞 外食：新增關鍵字\n' +
+  '  分類 刪 麥當勞：刪除關鍵字\n' +
+  '  分類清單：看自訂的關鍵字\n' +
   '【修改】\n' +
   '  最近：列出最近 10 筆和編號\n' +
   '  刪除 3：刪掉第 3 筆（只打「刪除」＝你的最後一筆）\n' +
@@ -85,6 +90,11 @@ function buildReply(chatId, src, text) {
   // 改 3 1200 / 改 3 11/20 豬肉 300
   const edit = text.match(/^改\s*(\d+)\s+([\s\S]+)$/);
   if (edit) return editNth(chatId, Number(edit[1]), edit[2].trim());
+
+  // 分類
+  if (cmd === '分類清單') return categoryRulesList();
+  const cat = text.match(/^分類\s*([\s\S]*)$/);
+  if (cat) return categoryCommand(chatId, cat[1].trim());
 
   // 查品項：「查 豬肉」「查豬肉」
   const q = text.match(/^查\s*(.+)$/);
@@ -182,6 +192,171 @@ function editNth(chatId, n, rest) {
     sh.getRange(r.row, 6, 1, 2).setValues([[after.item, after.amount]]);
     return '✏️ 已修改\n' + before + '\n→ ' + describe(after);
   });
+}
+
+// ---------- 分類 ----------
+const DEFAULT_CATS = {
+  '食材': ['全聯', '家樂福', '好市多', '超市', '市場', '買菜', '豬', '牛', '雞', '鴨', '魚', '蝦', '肉', '菜', '蛋', '奶', '豆腐', '豆漿', '米', '麵', '水果', '蘋果', '香蕉', '橘', '菇', '蔥', '蒜', '薑', '玉米', '起司', '泡菜', '冬粉', '地瓜', '四季豆', '洋蔥', '蘿蔔', '糕粉', '麵包', '吐司'],
+  '外食': ['漢堡王', '麥當勞', '肯德基', '摩斯', '早餐', '午餐', '晚餐', '宵夜', '便當', '餐廳', '火鍋', '拉麵', '咖啡', '星巴克', '飲料', '手搖', '珍奶', '外送', 'ubereats', 'foodpanda', '小吃', '滷味', '雞排'],
+  '日用品': ['衛生紙', '洗衣', '洗髮', '沐浴', '牙膏', '牙刷', '清潔', '垃圾袋', '電池', '日用', '面紙', '洗碗'],
+  '交通': ['加油', '油錢', '停車', '捷運', '公車', '高鐵', '台鐵', '火車', '計程車', 'uber', 'etag', '過路'],
+  '帳單': ['房租', '水費', '電費', '瓦斯', '網路', '電話費', '手機費', '管理費', '保險'],
+  '醫療': ['掛號', '藥', '診所', '醫院', '牙醫'],
+  '娛樂': ['電影', '遊戲', '訂閱', 'netflix', 'spotify', '旅遊', '門票'],
+};
+
+function customRules() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('CAT_RULES') || '{}'); }
+  catch (e) { return {}; }
+}
+function saveRules(rules) {
+  PropertiesService.getScriptProperties().setProperty('CAT_RULES', JSON.stringify(rules));
+}
+
+/** 品項 → 分類：自訂關鍵字優先；同類規則取在品項中最早出現（同位置取較長）的關鍵字 */
+function categorize(item, rules) {
+  const text = String(item).toLowerCase();
+  const best = function (pairs) {
+    let hit = null;
+    pairs.forEach(function (kc) {
+      const i = text.indexOf(kc[0].toLowerCase());
+      if (i < 0) return;
+      if (!hit || i < hit.i || (i === hit.i && kc[0].length > hit.k.length)) hit = { i: i, k: kc[0], c: kc[1] };
+    });
+    return hit && hit.c;
+  };
+  const custom = Object.keys(rules).map(function (k) { return [k, rules[k]]; });
+  const defaults = [];
+  Object.keys(DEFAULT_CATS).forEach(function (c) { DEFAULT_CATS[c].forEach(function (k) { defaults.push([k, c]); }); });
+  return best(custom) || best(defaults) || '其他';
+}
+
+function categoryCommand(chatId, arg) {
+  if (!arg || arg === '本月') return categoryReport(chatId, monthRange(0), '本月');
+  if (arg === '上月') return categoryReport(chatId, monthRange(-1), '上月');
+  if (arg === '本週' || arg === '本周') return categoryReport(chatId, weekRange(0), '本週');
+  if (arg === '上週' || arg === '上周') return categoryReport(chatId, weekRange(-1), '上週');
+  const del = arg.match(/^(?:刪|刪除)\s+(\S+)$/);
+  const rules = customRules();
+  if (del) {
+    if (!rules[del[1]]) return '沒有「' + del[1] + '」這個自訂關鍵字';
+    delete rules[del[1]];
+    saveRules(rules);
+    return '🗑 已刪除關鍵字「' + del[1] + '」';
+  }
+  const set = arg.match(/^(\S+)\s+(\S+)$/);
+  if (set) {
+    rules[set[1]] = set[2];
+    saveRules(rules);
+    return '🏷 之後品項有「' + set[1] + '」都算「' + set[2] + '」（舊紀錄也會跟著改）';
+  }
+  return '用法：分類／分類 上月／分類 麥當勞 外食／分類 刪 麥當勞';
+}
+
+function categoryRulesList() {
+  const rules = customRules();
+  const keys = Object.keys(rules);
+  const lines = ['🏷 預設分類：' + Object.keys(DEFAULT_CATS).join('、') + '、其他'];
+  if (!keys.length) lines.push('還沒有自訂關鍵字，範例：分類 麥當勞 外食');
+  else {
+    lines.push('—— 自訂關鍵字 ——');
+    keys.forEach(function (k) { lines.push(k + ' → ' + rules[k]); });
+  }
+  return lines.join('\n');
+}
+
+function categoryTotals(rows) {
+  const rules = customRules();
+  const t = {}, others = {};
+  rows.forEach(function (r) {
+    const c = categorize(r.item, rules);
+    t[c] = (t[c] || 0) + r.amount;
+    if (c === '其他') others[r.item] = true;
+  });
+  const list = Object.keys(t).sort(function (a, b) { return t[b] - t[a]; });
+  return { totals: t, list: list, others: Object.keys(others) };
+}
+
+function categoryLines(rows) {
+  const total = sum(rows);
+  const ct = categoryTotals(rows);
+  return ct.list.map(function (c) {
+    return c + ' ' + fmt(ct.totals[c]) + '（' + Math.round((ct.totals[c] / total) * 100) + '%）';
+  });
+}
+
+function categoryReport(chatId, range, label) {
+  const rows = fetchRows(chatId, range[0], range[1]);
+  const head = '🏷 ' + label + '分類 ' + md(range[0]) + '～' + md(range[1]);
+  if (!rows.length) return head + '\n沒有紀錄';
+  const lines = [head + '（共 ' + fmt(sum(rows)) + ' 元）'].concat(categoryLines(rows));
+  const others = categoryTotals(rows).others;
+  if (others.length) {
+    lines.push('—— 「其他」裡有 ——');
+    lines.push(others.slice(0, 8).join('、') + (others.length > 8 ? '…' : ''));
+    lines.push('可用「分類 關鍵字 類別」歸類');
+  }
+  return lines.join('\n');
+}
+
+function weekRange(offset) {
+  const t = today();
+  const from = addDays(t, -(weekday(t) - 1) + offset * 7);
+  return [from, addDays(from, 6)];
+}
+function monthRange(offset) {
+  const t = today();
+  let y = Number(t.slice(0, 4)), m = Number(t.slice(5, 7)) + offset;
+  if (m < 1) { m += 12; y -= 1; }
+  const from = y + '-' + pad(m) + '-01';
+  const nextFirst = (m === 12 ? y + 1 : y) + '-' + pad(m === 12 ? 1 : m + 1) + '-01';
+  return [from, addDays(nextFirst, -1)];
+}
+
+// ---------- 定時任務（由 loader 的 cron 每小時呼叫） ----------
+function cron() {
+  const t = today();
+  const hour = Number(Utilities.formatDate(new Date(), TZ, 'H'));
+  const props = PropertiesService.getScriptProperties();
+  // 每週一 9 點後送上週總結（每週只送一次）
+  if (weekday(t) === 1 && hour >= 9 && props.getProperty('LAST_WEEKLY') !== t) {
+    props.setProperty('LAST_WEEKLY', t);
+    sendWeeklySummaries();
+  }
+}
+
+function sendWeeklySummaries() {
+  const last = weekRange(-1);
+  const chats = {};
+  allRows().forEach(function (r) { if (r.date >= last[0] && r.date <= last[1]) chats[r.chatId] = true; });
+  Object.keys(chats).forEach(function (chatId) {
+    pushMessage(chatId, weeklySummary(chatId));
+  });
+}
+
+function weeklySummary(chatId) {
+  const last = weekRange(-1), prev = weekRange(-2);
+  const rows = fetchRows(chatId, last[0], last[1]);
+  const prevTotal = sum(fetchRows(chatId, prev[0], prev[1]));
+  const total = sum(rows);
+  const lines = ['📬 上週花費 ' + md(last[0]) + '～' + md(last[1]), '合計：' + fmt(total) + ' 元｜日均 ' + fmt(Math.round(total / 7))];
+  if (prevTotal > 0) {
+    const diff = total - prevTotal;
+    lines.push('比前一週' + (diff >= 0 ? '多 ' : '少 ') + fmt(Math.abs(diff)) + ' 元（' + (diff >= 0 ? '+' : '-') + Math.round(Math.abs(diff) / prevTotal * 100) + '%）');
+  }
+  lines.push('—— 分類 ——');
+  return lines.concat(categoryLines(rows)).concat(personLines(rows)).join('\n');
+}
+
+function pushMessage(to, text) {
+  const res = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token() },
+    payload: JSON.stringify({ to: to, messages: [{ type: 'text', text: text }] }),
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) console.error('LINE push 失敗 ' + res.getResponseCode() + ' ' + res.getContentText());
 }
 
 // ---------- 總計 ----------
@@ -481,3 +656,6 @@ function testToken() {
   });
   Logger.log(res.getResponseCode() + ' ' + res.getContentText());
 }
+
+// 給 loader 用（定時任務）
+globalThis.__bot = { handlePost: handlePost, testToken: testToken, cron: cron };
