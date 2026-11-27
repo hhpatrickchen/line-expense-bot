@@ -19,6 +19,7 @@ const HELP =
   '  今日、本週、上週、本月、上月：明細\n' +
   '  11/20：查某天\n' +
   '  查 豬肉：查品項（查 豬 牛＝任一）\n' +
+  '  查 外食：查分類（今日／本週／本月）\n' +
   '  分類：本月各類花費（分類 上月／本週／上週）\n' +
   '【分類設定】\n' +
   '  分類 麥當勞 外食：新增關鍵字\n' +
@@ -229,6 +230,12 @@ function categorize(item, rules) {
   const defaults = [];
   Object.keys(DEFAULT_CATS).forEach(function (c) { DEFAULT_CATS[c].forEach(function (k) { defaults.push([k, c]); }); });
   return best(custom) || best(defaults) || '其他';
+}
+
+function categoryNames(rules) {
+  const names = Object.keys(DEFAULT_CATS).concat(['其他']);
+  Object.keys(rules).forEach(function (k) { if (names.indexOf(rules[k]) < 0) names.push(rules[k]); });
+  return names;
 }
 
 function categoryCommand(chatId, arg) {
@@ -551,15 +558,22 @@ function itemReport(chatId, query) {
   const t = today();
   const weekFrom = addDays(t, -(weekday(t) - 1));
   const monthFrom = t.slice(0, 8) + '01';
+  // 關鍵字若是分類名稱（食材、外食…或自訂類別）→ 依分類比對；否則比對品項文字
+  const rules = customRules();
+  const cats = categoryNames(rules);
   const match = function (r) {
-    return keys.some(function (k) { return String(r.item).toLowerCase().indexOf(k.toLowerCase()) >= 0; });
+    return keys.some(function (k) {
+      if (cats.indexOf(k) >= 0) return categorize(r.item, rules) === k;
+      return String(r.item).toLowerCase().indexOf(k.toLowerCase()) >= 0;
+    });
   };
   const rows = fetchRows(chatId, monthFrom < weekFrom ? monthFrom : weekFrom, t).filter(match);
   const part = function (from) {
     const rs = rows.filter(function (r) { return r.date >= from; });
     return fmt(sum(rs)) + ' 元（' + rs.length + ' 筆）';
   };
-  const lines = ['🔍「' + keys.join('／') + '」花費', '今日：' + part(t), '本週：' + part(weekFrom), '本月：' + part(monthFrom)];
+  const label = keys.map(function (k) { return cats.indexOf(k) >= 0 ? k + '（分類）' : k; }).join('／');
+  const lines = ['🔍「' + label + '」花費', '今日：' + part(t), '本週：' + part(weekFrom), '本月：' + part(monthFrom)];
   const monthRows = rows.filter(function (r) { return r.date >= monthFrom; });
   if (monthRows.length) {
     lines.push('—— 本月明細 ——');
