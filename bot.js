@@ -9,15 +9,21 @@ const TZ = 'Asia/Taipei';
 const HEADER = ['日期', '記錄時間', '聊天室ID', '使用者ID', '名字', '品項', '金額'];
 const HELP =
   '📒 記帳機器人用法\n' +
-  '記帳（日期可省略＝今天）：\n' +
+  '【記帳】日期可省略＝今天\n' +
   '  漢堡王 447\n' +
   '  11/7 牛奶 331\n' +
-  '  11/20 全聯1627 玉米片 起司\n' +
-  '  （品項、金額可以換行寫）\n' +
-  '查詢：今日、本週、上週、本月、上月\n' +
-  '查某天：11/20\n' +
-  '查品項：查 豬肉（多個用空格：查 豬 牛）\n' +
-  '刪除：刪除（刪掉你最後一筆）';
+  '  一次記多筆（每行都要有金額）：\n' +
+  '  11/20\n  豬肉 300\n  青菜 120\n' +
+  '【查詢】\n' +
+  '  總計：今日／本週／本月總額\n' +
+  '  今日、本週、上週、本月、上月：明細\n' +
+  '  11/20：查某天\n' +
+  '  查 豬肉：查品項（查 豬 牛＝任一）\n' +
+  '【修改】\n' +
+  '  最近：列出最近 10 筆和編號\n' +
+  '  刪除 3：刪掉第 3 筆（只打「刪除」＝你的最後一筆）\n' +
+  '  改 3 1200：第 3 筆金額改成 1200\n' +
+  '  改 3 11/20 豬肉 300：整筆改掉';
 
 // 數字後面接這些字 → 是數量／時間，不是金額
 const QTY_UNITS = '條|個|包|盒|顆|斤|兩|瓶|罐|片|份|袋|入|支|隻|件|串|把|粒|杯|碗|盤|根|張|本|台|雙|公斤|公克|克|kg|g|ml|l|點|號|樓|歲|人|次|天|週|周|月|年|分|秒|小時|%';
@@ -53,16 +59,32 @@ function handleEvent(ev) {
 
 function buildReply(chatId, src, text) {
   const cmd = text.replace(/\s+/g, '');
+  if (['總計', '花費', '總覽', '總額'].includes(cmd)) return summaryReport(chatId);
   if (['今日', '今天', '今日花費'].includes(cmd)) return dayReport(chatId, today());
   if (['本週', '這週', '本周', '這周', '週報'].includes(cmd)) return weeklyReport(chatId, 0);
   if (['上週', '上周'].includes(cmd)) return weeklyReport(chatId, -1);
   if (['本月', '這個月', '月報'].includes(cmd)) return monthlyReport(chatId, 0);
   if (['上月', '上個月'].includes(cmd)) return monthlyReport(chatId, -1);
+  if (['說明', 'help', '幫助'].includes(cmd)) return HELP;
+
+  // 最近 / 最近20
+  const rec = cmd.match(/^最近(\d+)?$/);
+  if (rec) return recentReport(chatId, Math.min(Number(rec[1] || 10), 30));
+
+  // 刪除（自己最後一筆）/ 刪除 3（最近清單第 3 筆）
   if (['刪除', '取消', '撤銷'].includes(cmd)) {
     const row = deleteLast(chatId, src.userId);
-    return row ? '🗑 已刪除：' + md(row.date) + ' ' + row.item + ' ' + fmt(row.amount) : '你還沒有紀錄可以刪';
+    return row ? '🗑 已刪除：' + describe(row) : '你還沒有紀錄可以刪';
   }
-  if (['說明', 'help', '幫助'].includes(cmd)) return HELP;
+  const del = cmd.match(/^(?:刪除|刪)(\d+)$/);
+  if (del) {
+    const row = deleteNth(chatId, Number(del[1]));
+    return row ? '🗑 已刪除：' + describe(row) : '找不到第 ' + del[1] + ' 筆，先打「最近」看編號';
+  }
+
+  // 改 3 1200 / 改 3 11/20 豬肉 300
+  const edit = text.match(/^改\s*(\d+)\s+([\s\S]+)$/);
+  if (edit) return editNth(chatId, Number(edit[1]), edit[2].trim());
 
   // 查品項：「查 豬肉」「查豬肉」
   const q = text.match(/^查\s*(.+)$/);
@@ -72,12 +94,118 @@ function buildReply(chatId, src, text) {
   const onlyDate = parseLeadingDate(cmd);
   if (onlyDate && !onlyDate.rest) return dayReport(chatId, onlyDate.date);
 
-  const p = parseExpense(text);
-  if (!p) return null;
-  addExpense(p.date, chatId, src.userId, displayName(src), p.item, p.amount);
-  const dayTotal = sum(fetchRows(chatId, p.date, p.date));
-  const label = p.date === today() ? '今日' : md(p.date) + ' 當日';
-  return '✅ ' + md(p.date) + ' ' + p.item + '\n💰 ' + fmt(p.amount) + ' 元\n' + label + '累計：' + fmt(dayTotal) + ' 元';
+  // 記帳（一筆或多筆）
+  const entries = parseEntries(text);
+  if (!entries.length) return null;
+  const name = displayName(src);
+  entries.forEach(function (p) { addExpense(p.date, chatId, src.userId, name, p.item, p.amount); });
+  if (entries.length === 1) return '✅ ' + describe(entries[0]);
+  const total = entries.reduce(function (a, p) { return a + p.amount; }, 0);
+  return ['✅ 記了 ' + entries.length + ' 筆'].concat(entries.map(describe)).concat(['合計：' + fmt(total) + ' 元']).join('\n');
+}
+
+function describe(r) {
+  return md(r.date) + ' ' + r.item + ' ' + fmt(r.amount);
+}
+
+/**
+ * 一則訊息 → 一筆或多筆。
+ * 規則：去掉開頭日期後，若有 2 行以上且「每一行」都有品項和金額 → 每行一筆（行首也可各自寫日期）；
+ * 否則整則訊息當一筆（例如「牛奶、牛肉\n867」「買菜1000\n高麗菜\n地瓜」）。
+ */
+function parseEntries(text) {
+  let date = null;
+  let body = text.trim();
+  const d = parseLeadingDate(body);
+  if (d) { date = d.date; body = d.rest; }
+  const lines = body.split(/\n+/).map(function (l) { return l.trim(); }).filter(function (l) { return l; });
+  if (lines.length >= 2) {
+    const each = lines.map(function (l) {
+      const p = parseExpense(l);
+      if (p && date && !parseLeadingDate(l)) p.date = date;
+      return p;
+    });
+    if (each.every(function (p) { return p; })) return each;
+  }
+  const one = parseExpense(text);
+  return one ? [one] : [];
+}
+
+// ---------- 最近／刪除／修改 ----------
+/** 這個聊天室的紀錄，依輸入順序新到舊（第 1 筆＝最新） */
+function recentRows(chatId) {
+  return allRows().filter(function (r) { return r.chatId === chatId; }).reverse();
+}
+
+function recentReport(chatId, n) {
+  const rows = recentRows(chatId).slice(0, n);
+  if (!rows.length) return '還沒有任何紀錄';
+  const lines = ['🧾 最近 ' + rows.length + ' 筆（新→舊）'];
+  rows.forEach(function (r, i) { lines.push((i + 1) + '. ' + describe(r) + '（' + r.name + '）'); });
+  lines.push('刪除 N／改 N 金額 可修改');
+  return lines.join('\n');
+}
+
+function withLock(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function deleteNth(chatId, n) {
+  return withLock(function () {
+    const r = recentRows(chatId)[n - 1];
+    if (!r) return null;
+    sheet().deleteRow(r.row);
+    return r;
+  });
+}
+
+function editNth(chatId, n, rest) {
+  return withLock(function () {
+    const r = recentRows(chatId)[n - 1];
+    if (!r) return '找不到第 ' + n + ' 筆，先打「最近」看編號';
+    const before = describe(r);
+    const after = { date: r.date, item: r.item, amount: r.amount };
+    const num = rest.replace(/[$＄,元]/g, '').trim();
+    if (/^\d+(\.\d+)?$/.test(num)) {
+      after.amount = parseFloat(num);
+    } else {
+      const p = parseExpense(rest);
+      if (!p) return '看不懂要改成什麼，範例：改 ' + n + ' 1200 或 改 ' + n + ' 11/20 豬肉 300';
+      after.item = p.item;
+      after.amount = p.amount;
+      if (parseLeadingDate(rest)) after.date = p.date;
+    }
+    const sh = sheet();
+    sh.getRange(r.row, 1).setValue(after.date);
+    sh.getRange(r.row, 6, 1, 2).setValues([[after.item, after.amount]]);
+    return '✏️ 已修改\n' + before + '\n→ ' + describe(after);
+  });
+}
+
+// ---------- 總計 ----------
+function summaryReport(chatId) {
+  const t = today();
+  const weekFrom = addDays(t, -(weekday(t) - 1));
+  const monthFrom = t.slice(0, 8) + '01';
+  const rows = fetchRows(chatId, monthFrom < weekFrom ? monthFrom : weekFrom, t);
+  const pick = function (from) { return rows.filter(function (r) { return r.date >= from; }); };
+  const line = function (label, rs, days) {
+    let s = label + '：' + fmt(sum(rs)) + ' 元（' + rs.length + ' 筆）';
+    if (days > 1) s += '｜日均 ' + fmt(Math.round(sum(rs) / days));
+    return s;
+  };
+  const monthRows = pick(monthFrom);
+  const lines = [
+    '💰 花費總覽（' + md(t) + ' 週' + WK[weekday(t)] + '）',
+    line('今日', pick(t), 1),
+    line('本週', pick(weekFrom), weekday(t)),
+    line('本月', monthRows, Number(t.slice(8, 10))),
+  ];
+  const people = personLines(monthRows);
+  if (people.length) lines.push('—— 本月每人 ——');
+  return lines.concat(people.slice(1)).join('\n');
 }
 
 // ---------- 解析 ----------
