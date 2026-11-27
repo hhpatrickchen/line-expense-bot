@@ -85,7 +85,11 @@ function ownerId() { return P().getProperty('OWNER_ID'); }
 /** 讀取用戶清單；第一次執行時把舊的白名單（ALLOWED_CHATS）轉成使用中 */
 function registry() {
   const raw = P().getProperty('CHATS');
-  if (raw) { try { return JSON.parse(raw); } catch (e) {} }
+  if (raw) {
+    let reg = null;
+    try { reg = JSON.parse(raw); } catch (e) {}
+    if (reg) return reviewUnnamedOnce(reg);
+  }
   const reg = {};
   let legacy = [];
   try { legacy = JSON.parse(P().getProperty('ALLOWED_CHATS') || '[]'); } catch (e) {}
@@ -95,8 +99,50 @@ function registry() {
   saveRegistry(reg);
   return reg;
 }
+/** 一次性：舊版留下、沒有名稱的聊天室（主人自己除外）改成待審核，並補上名稱 */
+function reviewUnnamedOnce(reg) {
+  if (P().getProperty('REVIEW_UNNAMED_DONE')) return reg;
+  const owner = ownerId();
+  Object.keys(reg).forEach(function (id) {
+    if (!reg[id].name && id !== owner && reg[id].status === 'active') reg[id].status = 'pending';
+  });
+  P().setProperty('REVIEW_UNNAMED_DONE', '1');
+  fillNames(reg);
+  saveRegistry(reg);
+  return reg;
+}
+
 function saveRegistry(reg) { P().setProperty('CHATS', JSON.stringify(reg)); }
 function chatType(id) { return id.charAt(0) === 'C' ? '群組' : id.charAt(0) === 'R' ? '多人聊天' : '個人'; }
+
+/** 只用聊天室 ID 查名稱（群組名稱／個人暱稱） */
+function nameById(id) {
+  let r = null;
+  if (id.charAt(0) === 'C') r = lineGet('group/' + id + '/summary');
+  else if (id.charAt(0) === 'U') r = lineGet('profile/' + id);
+  else return '多人聊天室';
+  return r ? (r.groupName || r.displayName || '') : '';
+}
+
+/** 補上沒有名稱的聊天室 */
+function fillNames(reg) {
+  let changed = false;
+  Object.keys(reg).forEach(function (id) {
+    if (!reg[id].name) { const n = nameById(id); if (n) { reg[id].name = n; changed = true; } }
+  });
+  if (changed) saveRegistry(reg);
+}
+
+/** 每個聊天室有誰記過帳、各幾筆 */
+function chatStats() {
+  const st = {};
+  allRows().forEach(function (r) {
+    const e = st[r.chatId] = st[r.chatId] || { count: 0, people: [] };
+    e.count++;
+    if (r.name && e.people.indexOf(r.name) < 0) e.people.push(r.name);
+  });
+  return st;
+}
 
 function chatName(src) {
   let r = null;
@@ -240,15 +286,16 @@ function adminCommand(cmd, text, reg, chatId, src) {
 const STATUS_LABEL = { active: '✅使用中', pending: '⏳待審核', blocked: '⛔封鎖', new: '👀未申請' };
 
 function usersReport(reg) {
-  const counts = {};
-  allRows().forEach(function (r) { counts[r.chatId] = (counts[r.chatId] || 0) + 1; });
+  fillNames(reg);
+  const st = chatStats();
   const list = chatList(reg);
   if (!list.length) return '還沒有任何用戶';
   const lines = ['👥 用戶（模式：' + mode() + '）'];
   list.forEach(function (id, i) {
-    const e = reg[id];
+    const e = reg[id], c = st[id] || { count: 0, people: [] };
     lines.push((i + 1) + '. ' + (e.name || '(未知)') + '｜' + e.type + '｜' + (STATUS_LABEL[e.status] || e.status) +
-      '\n   ' + (counts[id] || 0) + ' 筆｜首次 ' + md(e.first) + '｜最近 ' + md(e.last || e.first) + (e.weekly ? '｜週報' : ''));
+      '\n   ' + c.count + ' 筆｜首次 ' + md(e.first) + '｜最近 ' + md(e.last || e.first) + (e.weekly ? '｜週報' : '') +
+      (c.people.length ? '\n   記帳的人：' + c.people.join('、') : ''));
   });
   lines.push('核准 N／封鎖 N／解封 N');
   return lines.join('\n');
@@ -258,12 +305,11 @@ function writeUsersSheet(reg) {
   const ss = getSpreadsheet();
   let sh = ss.getSheetByName('用戶');
   if (!sh) sh = ss.insertSheet('用戶');
-  const counts = {};
-  allRows().forEach(function (r) { counts[r.chatId] = (counts[r.chatId] || 0) + 1; });
-  const rows = [['編號', '名稱', '類型', '狀態', '記帳筆數', '首次使用', '最近活動', '週報', '聊天室ID']];
+  const st = chatStats();
+  const rows = [['編號', '名稱', '類型', '狀態', '記帳筆數', '記帳的人', '首次使用', '最近活動', '週報', '聊天室ID']];
   chatList(reg).forEach(function (id, i) {
-    const e = reg[id];
-    rows.push([i + 1, e.name || '', e.type, STATUS_LABEL[e.status] || e.status, counts[id] || 0, e.first, e.last || e.first, e.weekly ? '開' : '關', id]);
+    const e = reg[id], c = st[id] || { count: 0, people: [] };
+    rows.push([i + 1, e.name || '', e.type, STATUS_LABEL[e.status] || e.status, c.count, c.people.join('、'), e.first, e.last || e.first, e.weekly ? '開' : '關', id]);
   });
   sh.clearContents();
   sh.getRange(1, 1, rows.length, rows[0].length).setNumberFormat('@').setValues(rows);
