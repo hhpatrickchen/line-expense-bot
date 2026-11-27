@@ -16,3 +16,13 @@ function loadBot_() {
 function doPost(e) { return loadBot_().handlePost(e); }
 function testToken() { loadBot_().testToken(); }
 function clearCache() { CacheService.getScriptCache().remove('bot_code'); } // 想立刻換新版就執行這個
+
+// 授權用：bot.js 是動態載入的，Google 看不到它用了哪些服務，所以要在這裡列出來。
+// 第一次設定、或 bot.js 用到新服務時，在編輯器選 authorize 按執行並允許授權。
+function authorize() {
+  SpreadsheetApp.getActiveSpreadsheet();
+  SpreadsheetApp.openById; SpreadsheetApp.create;
+  PropertiesService.getScriptProperties();
+  LockService.getScriptLock();
+  UrlFetchApp.fetch('https://api.line.me/v2/bot/info', { muteHttpExceptions: true });
+}
