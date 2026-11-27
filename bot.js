@@ -40,7 +40,13 @@ function handleEvent(ev) {
   const src = ev.source;
   const chatId = src.groupId || src.roomId || src.userId;
   const text = ev.message.text.trim();
-  const reply = buildReply(chatId, src, text);
+  let reply;
+  try {
+    reply = buildReply(chatId, src, text);
+  } catch (err) {
+    console.error(err);
+    reply = '⚠️ 發生錯誤：' + (err && err.message ? err.message : err);
+  }
   if (reply) replyMessage(ev.replyToken, reply); // 一般聊天不回應
 }
 
