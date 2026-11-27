@@ -29,7 +29,8 @@ const HELP =
   '  最近：列出最近 10 筆和編號\n' +
   '  刪除 3：刪掉第 3 筆（只打「刪除」＝你的最後一筆）\n' +
   '  改 3 1200：第 3 筆金額改成 1200\n' +
-  '  改 3 11/20 豬肉 300：整筆改掉';
+  '  改 3 11/20 豬肉 300：整筆改掉\n' +
+  '【其他】週報 開／週報 關：每週一收上週總結';
 
 // 數字後面接這些字 → 是數量／時間，不是金額
 const QTY_UNITS = '條|個|包|盒|顆|斤|兩|瓶|罐|片|份|袋|入|支|隻|件|串|把|粒|杯|碗|盤|根|張|本|台|雙|公斤|公克|克|kg|g|ml|l|點|號|樓|歲|人|次|天|週|周|月|年|分|秒|小時|%';
@@ -55,8 +56,14 @@ function handleEvent(ev) {
   const text = ev.message.text.trim();
   let reply;
   try {
-    reply = accessControl(chatId, src, text);
-    if (reply === undefined) reply = buildReply(chatId, src, text);
+    const ac = accessControl(chatId, src, text);
+    if (ac === undefined || (ac && ac.prefix)) {
+      reply = buildReply(chatId, src, text);
+      if (ac && ac.prefix) reply = ac.prefix + (reply ? '\n\n' + reply : '\n打「說明」看用法');
+    } else {
+      reply = ac;
+    }
+    if (reply && ownerId() && src.userId === ownerId()) reply += pendingHint();
   } catch (err) {
     console.error(err);
     reply = '⚠️ 發生錯誤：' + (err && err.message ? err.message : err);
@@ -64,47 +71,220 @@ function handleEvent(ev) {
   if (reply) replyMessage(ev.replyToken, reply); // 一般聊天不回應
 }
 
-// ---------- 白名單：只有主人啟用過的聊天室能用 ----------
-function allowedChats() {
-  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('ALLOWED_CHATS') || '[]'); }
-  catch (e) { return []; }
+// ---------- 用戶管理（主人後台） ----------
+// 模式：開放（誰都能用）／審核（打「申請」後由主人核准）／私人（只有主人啟用的聊天室）
+// 狀態：active 使用中／pending 待審核／blocked 封鎖／new 尚未申請
+const DAILY_LIMIT = 100;      // 每個聊天室每天最多記幾筆
+const NOTIFY_LIMIT = 5;       // 每天最多推播幾則新申請通知給主人
+const PRIVACY_NOTE = 'ℹ️ 這個記帳機器人由管理者維護，記帳資料會存在管理者的 Google 試算表。';
+
+function P() { return PropertiesService.getScriptProperties(); }
+function mode() { return P().getProperty('MODE') || '審核'; }
+function ownerId() { return P().getProperty('OWNER_ID'); }
+
+/** 讀取用戶清單；第一次執行時把舊的白名單（ALLOWED_CHATS）轉成使用中 */
+function registry() {
+  const raw = P().getProperty('CHATS');
+  if (raw) { try { return JSON.parse(raw); } catch (e) {} }
+  const reg = {};
+  let legacy = [];
+  try { legacy = JSON.parse(P().getProperty('ALLOWED_CHATS') || '[]'); } catch (e) {}
+  // 既有的聊天室（白名單裡的、或試算表裡已經有紀錄的）一律維持可用
+  allRows().forEach(function (r) { if (legacy.indexOf(r.chatId) < 0) legacy.push(r.chatId); });
+  legacy.forEach(function (id) { reg[id] = { name: '', type: chatType(id), status: 'active', first: today(), last: today(), weekly: true, noted: true }; });
+  saveRegistry(reg);
+  return reg;
 }
-function setAllowed(list) {
-  PropertiesService.getScriptProperties().setProperty('ALLOWED_CHATS', JSON.stringify(list));
+function saveRegistry(reg) { P().setProperty('CHATS', JSON.stringify(reg)); }
+function chatType(id) { return id.charAt(0) === 'C' ? '群組' : id.charAt(0) === 'R' ? '多人聊天' : '個人'; }
+
+function chatName(src) {
+  let r = null;
+  if (src.type === 'group') r = lineGet('group/' + src.groupId + '/summary');
+  if (r && r.groupName) return r.groupName;
+  if (src.type === 'room') return '多人聊天室';
+  return displayName(src);
+}
+
+/** 依首次使用排序後的編號清單 */
+function chatList(reg) {
+  return Object.keys(reg).sort(function (a, b) {
+    return reg[a].first < reg[b].first ? -1 : reg[a].first > reg[b].first ? 1 : 0;
+  });
+}
+
+function notifyOwner(text) {
+  const owner = ownerId();
+  if (!owner) return;
+  const t = today();
+  let n = {};
+  try { n = JSON.parse(P().getProperty('NOTIFY_DAY') || '{}'); } catch (e) {}
+  if (n.day !== t) n = { day: t, count: 0 };
+  if (n.count >= NOTIFY_LIMIT) return;
+  n.count++;
+  P().setProperty('NOTIFY_DAY', JSON.stringify(n));
+  pushMessage(owner, text);
 }
 
 /**
- * 回傳 undefined → 放行給 buildReply；回傳字串 → 直接回覆；回傳 null → 不理會。
- * 設定主人：第一個打的人成為主人（之後別人打無效），並啟用該聊天室
- * 啟用／停用：只有主人能把目前的聊天室（群組）加入／移出白名單
+ * 回傳 undefined → 放行給 buildReply；字串 → 直接回覆；null → 不理會。
  */
 function accessControl(chatId, src, text) {
-  const props = PropertiesService.getScriptProperties();
-  const owner = props.getProperty('OWNER_ID');
+  const props = P();
+  const owner = ownerId();
+  const isOwner = !!owner && src.userId === owner;
   const cmd = text.replace(/\s+/g, '');
-  const isOwner = owner && src.userId === owner;
-  const list = allowedChats();
+  const reg = registry();
+  let entry = reg[chatId];
+  const touch = function () {
+    if (!entry.name) entry.name = chatName(src); // 舊聊天室補上名稱
+    entry.last = today(); reg[chatId] = entry; saveRegistry(reg);
+  };
 
+  // 主人設定（只能設定一次）
   if (cmd === '設定主人') {
-    if (!owner) {
-      props.setProperty('OWNER_ID', src.userId);
-      if (list.indexOf(chatId) < 0) { list.push(chatId); setAllowed(list); }
-      return '👑 你是主人了，這個聊天室已啟用。\n把我加進群組後，在群組打「啟用」才能使用。';
-    }
-    return isOwner ? '你已經是主人了' : null;
+    if (owner) return isOwner ? '你已經是主人了' : null;
+    props.setProperty('OWNER_ID', src.userId);
+    entry = entry || { name: chatName(src), type: chatType(chatId), first: today(), weekly: true };
+    entry.status = 'active'; entry.noted = true;
+    touch();
+    return '👑 你是主人了。打「管理說明」看後台指令。';
   }
-  if (cmd === '啟用') {
-    if (!isOwner) return null;
-    if (list.indexOf(chatId) < 0) { list.push(chatId); setAllowed(list); }
-    return '✅ 這個聊天室已啟用記帳';
+
+  // 主人後台指令
+  if (isOwner) {
+    const admin = adminCommand(cmd, text, reg, chatId, src);
+    if (admin !== undefined) return admin;
   }
-  if (cmd === '停用') {
-    if (!isOwner) return null;
-    setAllowed(list.filter(function (c) { return c !== chatId; }));
-    return '⏸ 這個聊天室已停用，主人打「啟用」可恢復';
+
+  // 新聊天室：登記
+  if (!entry) {
+    entry = { name: chatName(src), type: chatType(chatId), status: 'new', first: today(), weekly: false };
+    if (isOwner || mode() === '開放') entry.status = 'active';
   }
-  if (list.indexOf(chatId) < 0) return null; // 不在白名單：完全不理會、不寫入
+  if (entry.status === 'blocked') return null;
+  if (isOwner && entry.status !== 'active') entry.status = 'active';
+
+  if (entry.status === 'active') {
+    const firstTime = !entry.noted;
+    entry.noted = true;
+    touch();
+    if (firstTime) return { prefix: PRIVACY_NOTE };
+    return undefined;
+  }
+
+  // 尚未啟用
+  if (mode() === '私人') { touch(); return null; }
+  if (mode() === '開放') { entry.status = 'active'; entry.noted = true; touch(); return { prefix: PRIVACY_NOTE }; }
+
+  // 審核模式
+  if (cmd === '申請') {
+    if (entry.status === 'pending') return '⏳ 已經申請過了，請等管理者核准';
+    entry.status = 'pending';
+    touch();
+    const no = chatList(reg).indexOf(chatId) + 1;
+    notifyOwner('📮 新申請：' + (entry.name || '(未知)') + '（' + entry.type + '）\n打「核准 ' + no + '」或「封鎖 ' + no + '」');
+    return '📨 已送出申請，管理者核准後就能開始記帳。\n' + PRIVACY_NOTE;
+  }
+  if (entry.status === 'new' && !entry.hinted) {
+    entry.hinted = true;
+    touch();
+    return '👋 這是記帳機器人，需要申請才能使用。\n想用的話請打「申請」。';
+  }
+  touch();
+  return null;
+}
+
+function adminCommand(cmd, text, reg, chatId, src) {
+  const list = chatList(reg);
+  const pick = function (n) { return list[n - 1]; };
+  if (cmd === '管理說明') {
+    return '🛠 管理指令（主人限定）\n' +
+      '用戶：列出所有聊天室\n' +
+      '核准 3／封鎖 3／解封 3\n' +
+      '模式：看目前模式\n' +
+      '模式 開放／模式 審核／模式 私人\n' +
+      '啟用／停用：目前這個聊天室\n' +
+      '週報 開／週報 關：目前聊天室每週一收總結\n' +
+      '（試算表「用戶」分頁也看得到）';
+  }
+  if (cmd === '用戶') { writeUsersSheet(reg); return usersReport(reg); }
+  const m = cmd.match(/^模式(開放|審核|私人)?$/);
+  if (m) {
+    if (!m[1]) return '目前模式：' + mode() + '\n可改：模式 開放／模式 審核／模式 私人';
+    P().setProperty('MODE', m[1]);
+    return '🔧 已切換成「' + m[1] + '」模式';
+  }
+  const act = cmd.match(/^(核准|封鎖|解封)(\d+)$/);
+  if (act) {
+    const id = pick(Number(act[2]));
+    if (!id) return '找不到第 ' + act[2] + ' 個，先打「用戶」看編號';
+    if (id === src.userId && act[1] === '封鎖') return '不能封鎖自己';
+    reg[id].status = act[1] === '封鎖' ? 'blocked' : 'active';
+    saveRegistry(reg);
+    writeUsersSheet(reg);
+    if (act[1] === '核准') pushMessage(id, '🎉 管理者已核准，可以開始記帳了！打「說明」看用法。');
+    return (act[1] === '封鎖' ? '⛔ 已封鎖：' : '✅ 已' + act[1] + '：') + (reg[id].name || id);
+  }
+  if (cmd === '啟用' || cmd === '停用') {
+    const e = reg[chatId] || { name: chatName(src), type: chatType(chatId), first: today(), weekly: true };
+    e.status = cmd === '啟用' ? 'active' : 'blocked';
+    e.noted = true;
+    reg[chatId] = e;
+    saveRegistry(reg);
+    return cmd === '啟用' ? '✅ 這個聊天室已啟用記帳' : '⏸ 這個聊天室已停用，主人打「啟用」可恢復';
+  }
   return undefined;
+}
+
+const STATUS_LABEL = { active: '✅使用中', pending: '⏳待審核', blocked: '⛔封鎖', new: '👀未申請' };
+
+function usersReport(reg) {
+  const counts = {};
+  allRows().forEach(function (r) { counts[r.chatId] = (counts[r.chatId] || 0) + 1; });
+  const list = chatList(reg);
+  if (!list.length) return '還沒有任何用戶';
+  const lines = ['👥 用戶（模式：' + mode() + '）'];
+  list.forEach(function (id, i) {
+    const e = reg[id];
+    lines.push((i + 1) + '. ' + (e.name || '(未知)') + '｜' + e.type + '｜' + (STATUS_LABEL[e.status] || e.status) +
+      '\n   ' + (counts[id] || 0) + ' 筆｜首次 ' + md(e.first) + '｜最近 ' + md(e.last || e.first) + (e.weekly ? '｜週報' : ''));
+  });
+  lines.push('核准 N／封鎖 N／解封 N');
+  return lines.join('\n');
+}
+
+function writeUsersSheet(reg) {
+  const ss = getSpreadsheet();
+  let sh = ss.getSheetByName('用戶');
+  if (!sh) sh = ss.insertSheet('用戶');
+  const counts = {};
+  allRows().forEach(function (r) { counts[r.chatId] = (counts[r.chatId] || 0) + 1; });
+  const rows = [['編號', '名稱', '類型', '狀態', '記帳筆數', '首次使用', '最近活動', '週報', '聊天室ID']];
+  chatList(reg).forEach(function (id, i) {
+    const e = reg[id];
+    rows.push([i + 1, e.name || '', e.type, STATUS_LABEL[e.status] || e.status, counts[id] || 0, e.first, e.last || e.first, e.weekly ? '開' : '關', id]);
+  });
+  sh.clearContents();
+  sh.getRange(1, 1, rows.length, rows[0].length).setNumberFormat('@').setValues(rows);
+  sh.setFrozenRows(1);
+}
+
+/** 待審核數量提醒（附在回覆主人的訊息後面，不吃推播額度） */
+function pendingHint() {
+  const reg = registry();
+  const n = Object.keys(reg).filter(function (id) { return reg[id].status === 'pending'; }).length;
+  return n ? '\n\n📮 有 ' + n + ' 個待審核，打「用戶」查看' : '';
+}
+
+/** 今天這個聊天室記了幾筆（防洗版） */
+function bumpDailyCount(chatId, n) {
+  const cache = CacheService.getScriptCache();
+  const key = 'cnt_' + chatId + '_' + today();
+  const c = Number(cache.get(key) || 0);
+  if (c + n > DAILY_LIMIT) return false;
+  cache.put(key, String(c + n), 21600);
+  return true;
 }
 
 function buildReply(chatId, src, text) {
@@ -116,6 +296,12 @@ function buildReply(chatId, src, text) {
   if (['本月', '這個月', '月報'].includes(cmd)) return monthlyReport(chatId, 0);
   if (['上月', '上個月'].includes(cmd)) return monthlyReport(chatId, -1);
   if (['說明', 'help', '幫助'].includes(cmd)) return HELP;
+  const wk = cmd.match(/^週報(開|關)$/);
+  if (wk) {
+    const reg = registry();
+    if (reg[chatId]) { reg[chatId].weekly = wk[1] === '開'; saveRegistry(reg); }
+    return wk[1] === '開' ? '📬 每週一早上會發上週總結到這裡' : '🔕 已關閉每週總結';
+  }
 
   // 最近 / 最近20
   const rec = cmd.match(/^最近(\d+)?$/);
@@ -137,7 +323,7 @@ function buildReply(chatId, src, text) {
   if (edit) return editNth(chatId, Number(edit[1]), edit[2].trim());
 
   // 分類
-  if (cmd === '分類清單') return categoryRulesList();
+  if (cmd === '分類清單') return categoryRulesList(chatId);
   const cat = text.match(/^分類\s*([\s\S]*)$/);
   if (cat) return categoryCommand(chatId, cat[1].trim());
 
@@ -152,6 +338,7 @@ function buildReply(chatId, src, text) {
   // 記帳（一筆或多筆）
   const entries = parseEntries(text);
   if (!entries.length) return null;
+  if (!bumpDailyCount(chatId, entries.length)) return '⚠️ 今天已經記了 ' + DAILY_LIMIT + ' 筆，達到上限，明天再記';
   const name = displayName(src);
   entries.forEach(function (p) { addExpense(p.date, chatId, src.userId, name, p.item, p.amount); });
   if (entries.length === 1) return '✅ ' + describe(entries[0]);
@@ -250,12 +437,14 @@ const DEFAULT_CATS = {
   '娛樂': ['電影', '遊戲', '訂閱', 'netflix', 'spotify', '旅遊', '門票'],
 };
 
-function customRules() {
-  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('CAT_RULES') || '{}'); }
-  catch (e) { return {}; }
+/** 各聊天室自己的分類規則；還沒設定過的聊天室沿用舊版共用規則 */
+function customRules(chatId) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('CAT_RULES_' + chatId) || props.getProperty('CAT_RULES') || '{}';
+  try { return JSON.parse(raw); } catch (e) { return {}; }
 }
-function saveRules(rules) {
-  PropertiesService.getScriptProperties().setProperty('CAT_RULES', JSON.stringify(rules));
+function saveRules(chatId, rules) {
+  PropertiesService.getScriptProperties().setProperty('CAT_RULES_' + chatId, JSON.stringify(rules));
 }
 
 /** 品項 → 分類：自訂關鍵字優先；同類規則取在品項中最早出現（同位置取較長）的關鍵字 */
@@ -288,24 +477,24 @@ function categoryCommand(chatId, arg) {
   if (arg === '本週' || arg === '本周') return categoryReport(chatId, weekRange(0), '本週');
   if (arg === '上週' || arg === '上周') return categoryReport(chatId, weekRange(-1), '上週');
   const del = arg.match(/^(?:刪|刪除)\s+(\S+)$/);
-  const rules = customRules();
+  const rules = customRules(chatId);
   if (del) {
     if (!rules[del[1]]) return '沒有「' + del[1] + '」這個自訂關鍵字';
     delete rules[del[1]];
-    saveRules(rules);
+    saveRules(chatId, rules);
     return '🗑 已刪除關鍵字「' + del[1] + '」';
   }
   const set = arg.match(/^(\S+)\s+(\S+)$/);
   if (set) {
     rules[set[1]] = set[2];
-    saveRules(rules);
+    saveRules(chatId, rules);
     return '🏷 之後品項有「' + set[1] + '」都算「' + set[2] + '」（舊紀錄也會跟著改）';
   }
   return '用法：分類／分類 上月／分類 麥當勞 外食／分類 刪 麥當勞';
 }
 
-function categoryRulesList() {
-  const rules = customRules();
+function categoryRulesList(chatId) {
+  const rules = customRules(chatId);
   const keys = Object.keys(rules);
   const lines = ['🏷 預設分類：' + Object.keys(DEFAULT_CATS).join('、') + '、其他'];
   if (!keys.length) lines.push('還沒有自訂關鍵字，範例：分類 麥當勞 外食');
@@ -317,7 +506,7 @@ function categoryRulesList() {
 }
 
 function categoryTotals(rows) {
-  const rules = customRules();
+  const rules = customRules(rows.length ? rows[0].chatId : '');
   const t = {}, others = {};
   rows.forEach(function (r) {
     const c = categorize(r.item, rules);
@@ -379,9 +568,10 @@ function cron() {
 function sendWeeklySummaries() {
   const last = weekRange(-1);
   const chats = {};
-  const allowed = allowedChats();
+  const reg = registry();
   allRows().forEach(function (r) {
-    if (r.date >= last[0] && r.date <= last[1] && allowed.indexOf(r.chatId) >= 0) chats[r.chatId] = true;
+    const e = reg[r.chatId];
+    if (r.date >= last[0] && r.date <= last[1] && e && e.status === 'active' && e.weekly) chats[r.chatId] = true;
   });
   Object.keys(chats).forEach(function (chatId) {
     pushMessage(chatId, weeklySummary(chatId));
@@ -606,7 +796,7 @@ function itemReport(chatId, query) {
   const weekFrom = addDays(t, -(weekday(t) - 1));
   const monthFrom = t.slice(0, 8) + '01';
   // 關鍵字若是分類名稱（食材、外食…或自訂類別）→ 依分類比對；否則比對品項文字
-  const rules = customRules();
+  const rules = customRules(chatId);
   const cats = categoryNames(rules);
   const match = function (r) {
     return keys.some(function (k) {
