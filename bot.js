@@ -55,12 +55,56 @@ function handleEvent(ev) {
   const text = ev.message.text.trim();
   let reply;
   try {
-    reply = buildReply(chatId, src, text);
+    reply = accessControl(chatId, src, text);
+    if (reply === undefined) reply = buildReply(chatId, src, text);
   } catch (err) {
     console.error(err);
     reply = '⚠️ 發生錯誤：' + (err && err.message ? err.message : err);
   }
   if (reply) replyMessage(ev.replyToken, reply); // 一般聊天不回應
+}
+
+// ---------- 白名單：只有主人啟用過的聊天室能用 ----------
+function allowedChats() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('ALLOWED_CHATS') || '[]'); }
+  catch (e) { return []; }
+}
+function setAllowed(list) {
+  PropertiesService.getScriptProperties().setProperty('ALLOWED_CHATS', JSON.stringify(list));
+}
+
+/**
+ * 回傳 undefined → 放行給 buildReply；回傳字串 → 直接回覆；回傳 null → 不理會。
+ * 設定主人：第一個打的人成為主人（之後別人打無效），並啟用該聊天室
+ * 啟用／停用：只有主人能把目前的聊天室（群組）加入／移出白名單
+ */
+function accessControl(chatId, src, text) {
+  const props = PropertiesService.getScriptProperties();
+  const owner = props.getProperty('OWNER_ID');
+  const cmd = text.replace(/\s+/g, '');
+  const isOwner = owner && src.userId === owner;
+  const list = allowedChats();
+
+  if (cmd === '設定主人') {
+    if (!owner) {
+      props.setProperty('OWNER_ID', src.userId);
+      if (list.indexOf(chatId) < 0) { list.push(chatId); setAllowed(list); }
+      return '👑 你是主人了，這個聊天室已啟用。\n把我加進群組後，在群組打「啟用」才能使用。';
+    }
+    return isOwner ? '你已經是主人了' : null;
+  }
+  if (cmd === '啟用') {
+    if (!isOwner) return null;
+    if (list.indexOf(chatId) < 0) { list.push(chatId); setAllowed(list); }
+    return '✅ 這個聊天室已啟用記帳';
+  }
+  if (cmd === '停用') {
+    if (!isOwner) return null;
+    setAllowed(list.filter(function (c) { return c !== chatId; }));
+    return '⏸ 這個聊天室已停用，主人打「啟用」可恢復';
+  }
+  if (list.indexOf(chatId) < 0) return null; // 不在白名單：完全不理會、不寫入
+  return undefined;
 }
 
 function buildReply(chatId, src, text) {
@@ -335,7 +379,10 @@ function cron() {
 function sendWeeklySummaries() {
   const last = weekRange(-1);
   const chats = {};
-  allRows().forEach(function (r) { if (r.date >= last[0] && r.date <= last[1]) chats[r.chatId] = true; });
+  const allowed = allowedChats();
+  allRows().forEach(function (r) {
+    if (r.date >= last[0] && r.date <= last[1] && allowed.indexOf(r.chatId) >= 0) chats[r.chatId] = true;
+  });
   Object.keys(chats).forEach(function (chatId) {
     pushMessage(chatId, weeklySummary(chatId));
   });
