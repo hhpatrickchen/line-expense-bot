@@ -16,6 +16,7 @@ const HELP =
   '  （品項、金額可以換行寫）\n' +
   '查詢：今日、本週、上週、本月、上月\n' +
   '查某天：11/20\n' +
+  '查品項：查 豬肉（多個用空格：查 豬 牛）\n' +
   '刪除：刪除（刪掉你最後一筆）';
 
 // 數字後面接這些字 → 是數量／時間，不是金額
@@ -62,6 +63,10 @@ function buildReply(chatId, src, text) {
     return row ? '🗑 已刪除：' + md(row.date) + ' ' + row.item + ' ' + fmt(row.amount) : '你還沒有紀錄可以刪';
   }
   if (['說明', 'help', '幫助'].includes(cmd)) return HELP;
+
+  // 查品項：「查 豬肉」「查豬肉」
+  const q = text.match(/^查\s*(.+)$/);
+  if (q) return itemReport(chatId, q[1]);
 
   // 只打日期 → 查那天
   const onlyDate = parseLeadingDate(cmd);
@@ -234,6 +239,33 @@ function personLines(rows) {
   const list = Object.keys(t).sort(function (a, b) { return t[b] - t[a]; });
   if (list.length < 2) return [];
   return ['—— 每人 ——'].concat(list.map(function (k) { return k + '：' + fmt(t[k]); }));
+}
+
+/** 查某品項在今日／本週／本月的花費。關鍵字用空格分開＝任一符合 */
+function itemReport(chatId, query) {
+  const keys = query.split(/[\s、,，]+/).filter(function (k) { return k; });
+  if (!keys.length) return null;
+  const t = today();
+  const weekFrom = addDays(t, -(weekday(t) - 1));
+  const monthFrom = t.slice(0, 8) + '01';
+  const match = function (r) {
+    return keys.some(function (k) { return String(r.item).toLowerCase().indexOf(k.toLowerCase()) >= 0; });
+  };
+  const rows = fetchRows(chatId, monthFrom < weekFrom ? monthFrom : weekFrom, t).filter(match);
+  const part = function (from) {
+    const rs = rows.filter(function (r) { return r.date >= from; });
+    return fmt(sum(rs)) + ' 元（' + rs.length + ' 筆）';
+  };
+  const lines = ['🔍「' + keys.join('／') + '」花費', '今日：' + part(t), '本週：' + part(weekFrom), '本月：' + part(monthFrom)];
+  const monthRows = rows.filter(function (r) { return r.date >= monthFrom; });
+  if (monthRows.length) {
+    lines.push('—— 本月明細 ——');
+    monthRows.forEach(function (r) { lines.push(md(r.date) + ' ' + r.item + ' ' + fmt(r.amount)); });
+    if (monthRows.some(function (r) { return String(r.item).indexOf('、') >= 0; })) {
+      lines.push('※ 一筆裡有好幾樣東西時，算的是整筆金額');
+    }
+  }
+  return lines.join('\n');
 }
 
 function dayReport(chatId, date) {
